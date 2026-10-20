@@ -4,6 +4,7 @@ ResumeKit backend: static SPA + AI proxy (free OpenRouter models with fallback c
 import asyncio
 import base64
 import io
+import logging
 import json
 import os
 import re
@@ -52,6 +53,9 @@ FAST_MODELS = ["minimax/minimax-m3.1-flash:free"] + [m for m in MODELS if "minim
 WINDOW = 3600
 PER_IP_HOURLY = 60
 GLOBAL_DAILY = int(os.environ.get("GLOBAL_DAILY_AI", "1500"))
+
+log = logging.getLogger("resumekit")
+log.setLevel(logging.INFO)
 
 app = FastAPI(title="ResumeKit", docs_url=None, redoc_url=None)
 
@@ -134,6 +138,7 @@ async def _one(model, messages, max_tokens, temperature):
     if r.status_code == 429:
         raise HTTPException(429, "rate")
     if r.status_code != 200:
+        log.warning("model %s -> HTTP %s: %s", model, r.status_code, r.text[:200])
         raise HTTPException(502, f"{model}: HTTP {r.status_code}")
     data = r.json()
     return (data["choices"][0]["message"].get("content") or "").strip()
@@ -175,6 +180,7 @@ async def call_ai(messages, max_tokens=900, temperature=0.5, effort="minimal", m
                 return content
         except Exception as e:
             last_err = HTTPException(502, str(e))
+    log.warning("all models failed: %s", last_err.detail if isinstance(last_err, HTTPException) else last_err)
     raise last_err or HTTPException(502, "All free models are busy right now. Try again in a minute.")
 
 
@@ -504,6 +510,27 @@ def pdf_text(blob: bytes) -> str:
     return clean_text("\n".join(chunks))
 
 
+def ocr_pdf(blob: bytes, max_pages: int = 3) -> str:
+    """Local OCR for scanned PDFs. No model, no rate limits."""
+    try:
+        import fitz
+        import pytesseract
+        from PIL import Image
+    except ImportError:
+        return ""
+    chunks = []
+    try:
+        doc = fitz.open(stream=blob, filetype="pdf")
+        for page in list(doc)[:max_pages]:
+            pix = page.get_pixmap(dpi=220, colorspace=fitz.csGRAY)
+            img = Image.open(io.BytesIO(pix.tobytes("png")))
+            chunks.append(pytesseract.image_to_string(img, config="--psm 4"))
+    except Exception as e:
+        log.warning("ocr failed: %s", e)
+        return ""
+    return clean_text("\n".join(chunks))
+
+
 def pdf_images(blob: bytes, max_pages: int = 3) -> list:
     """Render pages to base64 PNGs for scanned/image-only PDFs."""
     try:
@@ -680,9 +707,10 @@ async def parse_resume_images(images: list) -> dict:
 async def import_resume(request: Request, file: UploadFile = File(...)):
     check_limit(request)
     blob = await file.read()
-    if len(blob) > 8 * 1024 * 1024:
-        raise HTTPException(413, "That file is larger than 8 MB.")
     name = (file.filename or "").lower()
+    log.info("import: name=%s size=%d type=%s", name, len(blob), file.content_type)
+    if len(blob) > 20 * 1024 * 1024:
+        raise HTTPException(413, "That file is larger than 20 MB.")
     try:
         if name.endswith(".pdf") or blob[:4] == b"%PDF":
             text = pdf_text(blob)
@@ -698,14 +726,25 @@ async def import_resume(request: Request, file: UploadFile = File(...)):
     except HTTPException:
         raise
     except Exception as e:
+        log.warning("extract failed for %s: %s", name, e)
         raise HTTPException(422, f"Could not read that file: {e}")
 
-    # Image-only PDF: no text layer, so read the pages visually instead.
+    # Image-only PDF: no text layer. OCR it locally first (fast, no rate limits),
+    # and only fall back to a vision model if OCR finds nothing usable.
     if len(text) < 150 and (name.endswith(".pdf") or blob[:4] == b"%PDF"):
+        ocr = ocr_pdf(blob)
+        log.info("scan detected: text=%d ocr=%d chars", len(text), len(ocr))
+        if len(ocr) >= 120:
+            return JSONResponse({"resume": await parse_resume_text(ocr), "method": "ocr"})
         pages = pdf_images(blob)
         if pages:
-            return JSONResponse({"resume": await parse_resume_images(pages), "method": "vision"})
-        raise HTTPException(422, "That PDF is a scan with no text layer. Paste the text instead.")
+            try:
+                return JSONResponse({"resume": await parse_resume_images(pages), "method": "vision"})
+            except HTTPException:
+                raise
+            except Exception as e:
+                log.warning("vision fallback failed: %s", e)
+        raise HTTPException(422, "That PDF is a scan I couldn't read. Paste the text and it will fill in just as well.")
 
     return JSONResponse({"resume": await parse_resume_text(text)})
 
