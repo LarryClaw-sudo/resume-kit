@@ -495,7 +495,7 @@ $('#btnJson').onclick = () => {
 $('#btnImport').onclick = () => $('#fileInput').click();
 
 /* ---------- import an existing resume (PDF / DOCX / TXT / pasted text) ---------- */
-function openImport() {
+function openImport(err) {
   openModal(`<h2>Import your current resume</h2>
     <p class="sub">Upload the PDF or Word file and I'll fill in every section. Wording is copied as written, not rewritten.</p>
     <div id="dropZone" style="border:1.5px dashed #cbd5e1;border-radius:12px;padding:26px 18px;text-align:center;cursor:pointer;background:var(--soft)">
@@ -510,6 +510,7 @@ function openImport() {
     <div class="field"><textarea id="impText" style="min-height:120px" placeholder="Paste your resume text here…"></textarea></div>
     <button class="btn btn-primary" id="impGo" style="margin-top:12px;width:100%;justify-content:center">Fill my resume</button>
     <div id="impOut" style="margin-top:12px"></div>`);
+  applyImportNotice(err);
 
   const dz = $('#dropZone'), fi = $('#impFile'), out = $('#impOut'), go = $('#impGo');
   let picked = null;
@@ -553,7 +554,47 @@ function openImport() {
     go.disabled = false; go.textContent = 'Fill my resume';
   };
 }
-$('#btnResumeImport').onclick = openImport;
+/* Clicking the button goes straight to the OS file picker. The drop/paste dialog
+   only appears if the file can't be read, as a fallback. */
+async function importFile(file) {
+  openModal(`<h2>Reading your resume</h2>
+    <p class="sub">${esc(file.name)}</p>
+    <div id="impProgress" style="display:flex;align-items:center;gap:10px;color:var(--muted);font-size:13.5px">
+      <span class="spin" style="border-color:#cbd5e1;border-top-color:#0f766e"></span> Extracting sections, dates and bullets…
+    </div>
+    <div id="impOut" style="margin-top:14px"></div>`);
+  try {
+    const fd = new FormData();
+    fd.append('file', file);
+    const r = await fetch('/api/import', { method: 'POST', body: fd });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data.detail || 'Import failed');
+    const layout = { template: state.template, font: state.font, accent: state.accent };
+    state = Object.assign(sample(), data.resume, layout);
+    save(); renderEditor(); renderPreview();
+    $('#tplSelect').value = state.template;
+    modal.classList.remove('open');
+    const roles = (state.experience || []).length, edu = (state.education || []).length;
+    toast(`Imported${roles ? ` · ${roles} role${roles > 1 ? 's' : ''}` : ''}${edu ? ` · ${edu} education` : ''}. Check the wording.`);
+  } catch (e) {
+    openImport(e.message);
+  }
+}
+
+function applyImportNotice(msg) {
+  const out = $('#impOut');
+  if (out && msg) out.innerHTML = `<p style="color:#b91c1c;font-size:13.5px">${esc(msg)}</p>`;
+}
+
+$('#btnResumeImport').onclick = () => {
+  const inp = $('#resumeFile');
+  inp.value = '';
+  inp.click();               // straight to the file dialog
+};
+$('#resumeFile').onchange = e => {
+  const f = e.target.files && e.target.files[0];
+  if (f) importFile(f);
+};
 
 $('#fileInput').onchange = async e => {
   const f = e.target.files[0]; if (!f) return;
