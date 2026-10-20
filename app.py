@@ -13,7 +13,8 @@ from datetime import date
 from pathlib import Path
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from pypdf import PdfReader
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from docx import Document
@@ -36,6 +37,9 @@ DEFAULT_CHAIN = [
 ]
 MODELS = [m.strip() for m in os.environ.get("AI_MODELS", "").split(",") if m.strip()] or DEFAULT_CHAIN
 MODEL = MODELS[0]
+# Parsing a whole resume is a big, mechanical JSON task: the lighter model is
+# ~3x faster and just as accurate at extraction, so try it first.
+FAST_MODELS = ["minimax/minimax-m3.1-flash:free"] + [m for m in MODELS if "minimax" not in m]
 
 WINDOW = 3600
 PER_IP_HOURLY = 60
@@ -117,12 +121,12 @@ async def _one(model, messages, max_tokens, temperature):
     return (data["choices"][0]["message"].get("content") or "").strip()
 
 
-async def call_ai(messages, max_tokens=900, temperature=0.5, effort="minimal"):
+async def call_ai(messages, max_tokens=900, temperature=0.5, effort="minimal", models=None):
     """Try each free model in the chain. Reasoning models burn budget on thinking,
     so short answers come back empty; retry once with double the budget before
     falling through to the next model."""
     last_err = None
-    for model in MODELS:
+    for model in (models or MODELS):
         for attempt, budget in enumerate((max_tokens, max_tokens * 2)):
             try:
                 content = await _one(model, messages, budget, temperature)
@@ -429,6 +433,219 @@ async def export_docx(request: Request):
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         headers={"Content-Disposition": f'attachment; filename="{name}_Resume.docx"'},
     )
+
+# ---------------------------------------------------------------- resume import
+SCHEMA_HINT = """{
+  "contact": {"name": "", "title": "", "email": "", "phone": "", "location": "", "website": "", "linkedin": ""},
+  "summary": "",
+  "experience": [{"role": "", "company": "", "location": "", "start": "", "end": "", "current": false, "bullets": [""]}],
+  "education": [{"degree": "", "field": "", "school": "", "location": "", "start": "", "end": "", "gpa": "", "details": ""}],
+  "skills": [{"category": "", "items": [""]}],
+  "projects": [{"name": "", "link": "", "description": ""}],
+  "certifications": [{"name": "", "issuer": "", "year": ""}],
+  "languages": [{"name": "", "level": ""}]
+}"""
+
+
+def clean_text(raw: str) -> str:
+    raw = raw.replace("\r", "\n")
+    lines = [re.sub(r"[ \t]+", " ", ln).strip() for ln in raw.split("\n")]
+    out, blank = [], False
+    for ln in lines:
+        if not ln:
+            if not blank:
+                out.append("")
+            blank = True
+        else:
+            out.append(ln)
+            blank = False
+    return "\n".join(out).strip()
+
+
+def pdf_text(blob: bytes) -> str:
+    reader = PdfReader(io.BytesIO(blob))
+    chunks = []
+    for page in reader.pages[:12]:
+        try:
+            chunks.append(page.extract_text() or "")
+        except Exception:
+            continue
+    return clean_text("\n".join(chunks))
+
+
+def docx_text(blob: bytes) -> str:
+    doc = Document(io.BytesIO(blob))
+    parts = [p.text for p in doc.paragraphs]
+    for table in doc.tables:
+        for row in table.rows:
+            parts.append(" | ".join(c.text.strip() for c in row.cells))
+    return clean_text("\n".join(parts))
+
+
+def s(v, limit=400) -> str:
+    if v is None:
+        return ""
+    return re.sub(r"\s+", " ", str(v)).strip()[:limit]
+
+
+def as_list(v):
+    if isinstance(v, list):
+        return v
+    if v in (None, ""):
+        return []
+    return [v]
+
+
+def normalize(parsed: dict) -> dict:
+    """Coerce whatever the model returned into the builder's shape."""
+    if not isinstance(parsed, dict):
+        raise HTTPException(502, "Could not read that resume. Try the paste option below.")
+    if isinstance(parsed.get("resume"), dict):
+        parsed = parsed["resume"]
+
+    c = parsed.get("contact") or {}
+    contact = {k: s(c.get(k), 200) for k in
+               ("name", "title", "email", "phone", "location", "website", "linkedin")}
+    # Resumes are often set in all caps; the builder wants normal casing.
+    if contact["name"] and contact["name"].isupper():
+        contact["name"] = contact["name"].title()
+
+    experience = []
+    for e in as_list(parsed.get("experience"))[:12]:
+        if not isinstance(e, dict):
+            continue
+        bullets = [s(b, 400) for b in as_list(e.get("bullets") or e.get("achievements")) if s(b)]
+        if not bullets and e.get("description"):
+            bullets = [s(x, 400) for x in re.split(r"(?<=[.!?])\s+|\n", s(e["description"], 2000)) if len(x) > 12]
+        experience.append({
+            "role": s(e.get("role") or e.get("title") or e.get("position"), 160),
+            "company": s(e.get("company") or e.get("employer") or e.get("organization"), 160),
+            "location": s(e.get("location"), 120),
+            "start": s(e.get("start") or e.get("start_date"), 60),
+            "end": s(e.get("end") or e.get("end_date"), 60),
+            "current": bool(e.get("current")) or s(e.get("end")).lower() in ("present", "current", "now"),
+            "bullets": bullets,
+        })
+
+    education = []
+    for e in as_list(parsed.get("education"))[:8]:
+        if not isinstance(e, dict):
+            continue
+        education.append({
+            "degree": s(e.get("degree"), 120),
+            "field": s(e.get("field") or e.get("major"), 120),
+            "school": s(e.get("school") or e.get("institution"), 160),
+            "location": s(e.get("location"), 120),
+            "start": s(e.get("start") or e.get("start_date"), 60),
+            "end": s(e.get("end") or e.get("end_date"), 60),
+            "gpa": s(e.get("gpa"), 40),
+            "details": s(e.get("details") or e.get("honors"), 300),
+        })
+
+    skills = []
+    for grp in as_list(parsed.get("skills"))[:8]:
+        if isinstance(grp, dict):
+            items = [s(i, 60) for i in as_list(grp.get("items") or grp.get("skills")) if s(i)]
+            if items:
+                skills.append({"category": s(grp.get("category") or grp.get("name") or "Skills", 60), "items": items})
+        elif isinstance(grp, str) and s(grp):
+            skills.append({"category": "Skills", "items": [x.strip() for x in re.split(r"[,;|/]", grp) if x.strip()][:30]})
+    if not skills:
+        plain = parsed.get("skills")
+        if isinstance(plain, str) and plain.strip():
+            skills.append({"category": "Skills", "items": [x.strip() for x in re.split(r"[,;|]", plain) if x.strip()]})
+
+    projects = []
+    for pr in as_list(parsed.get("projects"))[:8]:
+        if isinstance(pr, dict):
+            projects.append({"name": s(pr.get("name") or pr.get("title"), 160),
+                             "link": s(pr.get("link") or pr.get("url"), 200),
+                             "description": s(pr.get("description") or pr.get("details"), 600)})
+
+    certs = []
+    for c2 in as_list(parsed.get("certifications"))[:10]:
+        if isinstance(c2, dict):
+            certs.append({"name": s(c2.get("name") or c2.get("certification"), 160),
+                          "issuer": s(c2.get("issuer") or c2.get("organization"), 160),
+                          "year": s(c2.get("year") or c2.get("date"), 40)})
+        elif isinstance(c2, str):
+            certs.append({"name": s(c2, 160), "issuer": "", "year": ""})
+
+    langs = []
+    for l in as_list(parsed.get("languages"))[:8]:
+        if isinstance(l, dict):
+            langs.append({"name": s(l.get("name") or l.get("language"), 80), "level": s(l.get("level") or l.get("proficiency"), 60)})
+        elif isinstance(l, str):
+            langs.append({"name": s(l, 80), "level": ""})
+
+    out = {
+        "contact": contact,
+        "summary": s(parsed.get("summary") or parsed.get("profile") or parsed.get("objective"), 1200),
+        "experience": [e for e in experience if e["role"] or e["company"]],
+        "education": [e for e in education if e["school"] or e["degree"]],
+        "skills": skills,
+        "projects": [p for p in projects if p["name"] or p["description"]],
+        "certifications": [c3 for c3 in certs if c3["name"]],
+        "languages": [l for l in langs if l["name"]],
+    }
+    if not any([out["contact"]["name"], out["experience"], out["education"], out["summary"]]):
+        raise HTTPException(422, "I couldn't find resume content in that file. Try pasting the text instead.")
+    return out
+
+
+async def parse_resume_text(text: str) -> dict:
+    text = clean_text(text)[:16000]
+    if len(text) < 60:
+        raise HTTPException(422, "That file has almost no text in it. It may be a scan or an image-only PDF.")
+    messages = [
+        {"role": "system", "content": SYSTEM + " You extract resume data into JSON exactly, without inventing anything."},
+        {"role": "user", "content": (
+            "Extract this resume into JSON. Copy the wording as written; do not rewrite, improve, or invent. "
+            "Split the experience section into one object per job with its bullets. "
+            "Keep dates in the form they appear. Use \"current\": true when the job says Present. "
+            "Group skills under sensible categories. Omit anything absent.\n\n"
+            f"JSON shape:\n{SCHEMA_HINT}\n\nRESUME TEXT:\n{text}"
+        )},
+    ]
+    raw = await call_ai(messages, 3000, 0.15, models=FAST_MODELS)
+    data = parse_json(raw)
+    if data is None:
+        raise HTTPException(502, "The model returned unreadable data. Try again or paste the text.")
+    return normalize(data)
+
+
+@app.post("/api/import")
+async def import_resume(request: Request, file: UploadFile = File(...)):
+    check_limit(request)
+    blob = await file.read()
+    if len(blob) > 8 * 1024 * 1024:
+        raise HTTPException(413, "That file is larger than 8 MB.")
+    name = (file.filename or "").lower()
+    try:
+        if name.endswith(".pdf") or blob[:4] == b"%PDF":
+            text = pdf_text(blob)
+        elif name.endswith((".docx", ".doc")):
+            try:
+                text = docx_text(blob)
+            except Exception:
+                raise HTTPException(422, "Could not read that Word file. Save it as PDF and try again.")
+        elif name.endswith((".txt", ".md")):
+            text = clean_text(blob.decode("utf-8", "ignore"))
+        else:
+            raise HTTPException(415, "Upload a PDF, Word file, or plain text resume.")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(422, f"Could not read that file: {e}")
+    return JSONResponse({"resume": await parse_resume_text(text)})
+
+
+@app.post("/api/import-text")
+async def import_resume_text(request: Request):
+    check_limit(request)
+    body = await request.json()
+    return JSONResponse({"resume": await parse_resume_text(body.get("text") or "")})
+
 
 # ---------------------------------------------------------------- static
 @app.get("/build")

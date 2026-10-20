@@ -493,6 +493,68 @@ $('#btnJson').onclick = () => {
   a.click();
 };
 $('#btnImport').onclick = () => $('#fileInput').click();
+
+/* ---------- import an existing resume (PDF / DOCX / TXT / pasted text) ---------- */
+function openImport() {
+  openModal(`<h2>Import your current resume</h2>
+    <p class="sub">Upload the PDF or Word file and I'll fill in every section. Wording is copied as written, not rewritten.</p>
+    <div id="dropZone" style="border:1.5px dashed #cbd5e1;border-radius:12px;padding:26px 18px;text-align:center;cursor:pointer;background:var(--soft)">
+      <div style="font-size:22px;line-height:1">⬆</div>
+      <div style="font-weight:650;font-size:14px;margin-top:8px">Drop a PDF, .docx or .txt here</div>
+      <div style="font-size:12.5px;color:var(--muted);margin-top:3px">or click to choose a file (max 8 MB)</div>
+      <input type="file" id="impFile" accept=".pdf,.docx,.doc,.txt,.md" hidden>
+    </div>
+    <div style="display:flex;align-items:center;gap:10px;margin:16px 0 4px;color:var(--muted);font-size:12px">
+      <div style="flex:1;height:1px;background:var(--line)"></div>or paste the text<div style="flex:1;height:1px;background:var(--line)"></div>
+    </div>
+    <div class="field"><textarea id="impText" style="min-height:120px" placeholder="Paste your resume text here…"></textarea></div>
+    <button class="btn btn-primary" id="impGo" style="margin-top:12px;width:100%;justify-content:center">Fill my resume</button>
+    <div id="impOut" style="margin-top:12px"></div>`);
+
+  const dz = $('#dropZone'), fi = $('#impFile'), out = $('#impOut'), go = $('#impGo');
+  let picked = null;
+  dz.onclick = () => fi.click();
+  fi.onchange = () => { if (fi.files[0]) { picked = fi.files[0]; dz.querySelector('div:nth-child(2)').textContent = picked.name; } };
+  dz.ondragover = e => { e.preventDefault(); dz.style.borderColor = 'var(--accent)'; dz.style.background = '#f0fbf8'; };
+  dz.ondragleave = () => { dz.style.borderColor = '#cbd5e1'; dz.style.background = 'var(--soft)'; };
+  dz.ondrop = e => {
+    e.preventDefault(); dz.style.borderColor = '#cbd5e1'; dz.style.background = 'var(--soft)';
+    const f = e.dataTransfer.files[0];
+    if (f) { picked = f; dz.querySelector('div:nth-child(2)').textContent = f.name; }
+  };
+  go.onclick = async () => {
+    const text = $('#impText').value.trim();
+    if (!picked && !text) { out.innerHTML = '<p style="color:#b91c1c;font-size:13.5px">Pick a file or paste some text first.</p>'; return; }
+    go.disabled = true; go.innerHTML = '<span class="spin"></span> Reading your resume…';
+    out.innerHTML = '<p style="color:var(--muted);font-size:12.5px">Pulling out sections and dates. This takes 10-30 seconds.</p>';
+    try {
+      let data;
+      if (picked) {
+        const fd = new FormData(); fd.append('file', picked);
+        const r = await fetch('/api/import', { method: 'POST', body: fd });
+        data = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(data.detail || 'Import failed');
+      } else {
+        const r = await fetch('/api/import-text', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }) });
+        data = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(data.detail || 'Import failed');
+      }
+      const layout = { template: state.template, font: state.font, accent: state.accent };
+      const imported = Object.assign(sample(), data.resume, layout);
+      state = imported;
+      save(); renderEditor(); renderPreview();
+      $('#tplSelect').value = state.template;
+      modal.classList.remove('open');
+      const roles = (state.experience || []).length, edu = (state.education || []).length;
+      toast(`Imported${roles ? ` · ${roles} role${roles > 1 ? 's' : ''}` : ''}${edu ? ` · ${edu} education` : ''}. Check the wording.`);
+    } catch (e) {
+      out.innerHTML = `<p style="color:#b91c1c;font-size:13.5px">${esc(e.message)}</p>`;
+    }
+    go.disabled = false; go.textContent = 'Fill my resume';
+  };
+}
+$('#btnResumeImport').onclick = openImport;
+
 $('#fileInput').onchange = async e => {
   const f = e.target.files[0]; if (!f) return;
   try {

@@ -6,6 +6,10 @@ Self-hosted AI resume builder — the capability set of resume-now.com, rebuilt 
 
 ## What it does
 
+- **Import an existing resume** — PDF, .docx, .txt, or pasted text is parsed into
+  every section (contact, summary, roles with bullets, education, skills, projects,
+  certs, languages); wording is copied, not rewritten
+
 - 8 ATS-friendly templates, live A4 preview, accent + font controls, autosave to localStorage
 - AI writing: summary, experience bullets, skills, job tailoring, cover letters, ATS review with score
 - Export: print-perfect PDF (browser print) and a real `.docx` built with python-docx
@@ -58,6 +62,9 @@ Server side: `/opt/resumekit`, systemd unit `resumekit.service`, secrets in
 ## API
 
 - `POST /api/ai` `{task, payload}` — tasks: `bullets`, `summary`, `skills`, `review`, `cover`, `tailor`
+- `POST /api/import` multipart `file` — PDF/DOCX/TXT -> structured resume JSON (pdf text is
+  extracted with pypdf server-side; imports use the faster model first)
+- `POST /api/import-text` `{text}` — same parser for pasted text or scanned PDFs
 - `POST /api/export/docx` `{resume}` — returns a .docx
 - `GET /api/health`
 
