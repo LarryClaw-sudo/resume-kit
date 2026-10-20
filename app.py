@@ -1,6 +1,7 @@
 """
-ResumeKit backend: static SPA + AI proxy (opencode go / deepseek-v4.1-flash) + DOCX export.
+ResumeKit backend: static SPA + AI proxy (free OpenRouter models with fallback chain) + DOCX export.
 """
+import asyncio
 import io
 import json
 import os
@@ -22,9 +23,19 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_TAB_ALIGNMENT
 BASE_DIR = Path(__file__).resolve().parent
 STATIC = BASE_DIR / "static"
 
-API_KEY = os.environ.get("OPENCODE_GO_API_KEY", "")
-API_BASE = os.environ.get("OPENCODE_BASE_URL", "https://opencode.ai/zen/go/v1")
-MODEL = os.environ.get("RESUME_MODEL", "deepseek-v4.1-flash")
+OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+OPENROUTER_BASE = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+OPENCODE_KEY = os.environ.get("OPENCODE_GO_API_KEY", "")
+OPENCODE_BASE = os.environ.get("OPENCODE_BASE_URL", "https://opencode.ai/zen/go/v1")
+
+# Free-tier OpenRouter models, tried in order until one answers.
+DEFAULT_CHAIN = [
+    "nvidia/nemotron-3-ultra-550b-a55b:free",
+    "minimax/minimax-m3.1-flash:free",
+    "openrouter/free",
+]
+MODELS = [m.strip() for m in os.environ.get("AI_MODELS", "").split(",") if m.strip()] or DEFAULT_CHAIN
+MODEL = MODELS[0]
 
 WINDOW = 3600
 PER_IP_HOURLY = 60
@@ -74,40 +85,63 @@ def parse_json(text: str):
             return None
     return None
 
-async def call_ai(messages, max_tokens=900, temperature=0.5, effort="minimal"):
-    if not API_KEY:
-        raise HTTPException(500, "AI backend is not configured.")
-    payload = {
-        "model": MODEL,
-        "messages": messages,
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-        # deepseek-v4.1-flash is a reasoning model: without this, reasoning tokens
-        # eat the whole budget and content comes back empty.
-        "reasoning_effort": effort,
-    }
-    headers = {
-        "Authorization": f"Bearer {API_KEY}",
+def provider_for(model: str):
+    """Return (base_url, headers) for a model id."""
+    if model.startswith("openrouter/") or model.endswith(":free") or "/" in model:
+        if not OPENROUTER_KEY:
+            raise HTTPException(500, "OpenRouter key is not configured.")
+        return OPENROUTER_BASE, {
+            "Authorization": f"Bearer {OPENROUTER_KEY}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://resume.kavilabs.dev",
+            "X-Title": "ResumeKit",
+        }
+    if not OPENCODE_KEY:
+        raise HTTPException(500, "No AI provider is configured for this model.")
+    return OPENCODE_BASE, {
+        "Authorization": f"Bearer {OPENCODE_KEY}",
         "Content-Type": "application/json",
         "x-opencode-session": str(uuid.uuid4()),
     }
-    for attempt in range(2):
-        try:
-            r = await client.post(f"{API_BASE}/chat/completions", json=payload, headers=headers)
-            if r.status_code >= 500 and attempt == 0:
-                continue
-            if r.status_code != 200:
-                raise HTTPException(502, f"AI provider returned {r.status_code}")
-            data = r.json()
-            content = (data["choices"][0]["message"].get("content") or "").strip()
-            if not content and attempt == 0:
-                payload["max_tokens"] = max_tokens * 2
-                continue
-            return content
-        except httpx.TimeoutException:
-            if attempt == 1:
-                raise HTTPException(504, "AI timed out. Try again.")
-    raise HTTPException(502, "AI request failed.")
+
+
+async def _one(model, messages, max_tokens, temperature):
+    base, headers = provider_for(model)
+    payload = {"model": model, "messages": messages, "max_tokens": max_tokens, "temperature": temperature}
+    r = await client.post(f"{base}/chat/completions", json=payload, headers=headers)
+    if r.status_code == 429:
+        raise HTTPException(429, "rate")
+    if r.status_code != 200:
+        raise HTTPException(502, f"{model}: HTTP {r.status_code}")
+    data = r.json()
+    return (data["choices"][0]["message"].get("content") or "").strip()
+
+
+async def call_ai(messages, max_tokens=900, temperature=0.5, effort="minimal"):
+    """Try each free model in the chain. Reasoning models burn budget on thinking,
+    so short answers come back empty; retry once with double the budget before
+    falling through to the next model."""
+    last_err = None
+    for model in MODELS:
+        for attempt, budget in enumerate((max_tokens, max_tokens * 2)):
+            try:
+                content = await _one(model, messages, budget, temperature)
+                if content:
+                    return content
+            except HTTPException as e:
+                last_err = e
+                if e.status_code == 429:
+                    await asyncio.sleep(1.2 + attempt)
+                    continue
+                break
+            except httpx.TimeoutException:
+                last_err = HTTPException(504, "AI timed out.")
+                break
+            except Exception as e:  # malformed provider reply
+                last_err = HTTPException(502, str(e))
+                break
+    raise last_err or HTTPException(502, "All free models are busy right now. Try again in a minute.")
+
 
 SYSTEM = (
     "You are a senior resume writer and ATS specialist with 15 years of recruiting experience. "
@@ -154,7 +188,7 @@ async def handle_task(task: str, p: dict):
             f"12-24 words each, no periods at the end, no personal pronouns. "
             f'Return JSON only: {{"bullets": ["...", "..."]}}'
         )
-        out = await call_ai([{"role": "system", "content": SYSTEM}, {"role": "user", "content": msg}], 1000)
+        out = await call_ai([{"role": "system", "content": SYSTEM}, {"role": "user", "content": msg}], 1600)
         data = parse_json(out)
         if isinstance(data, dict) and isinstance(data.get("bullets"), list):
             return {"bullets": [str(b).strip(" -•") for b in data["bullets"]][:n]}
@@ -169,7 +203,7 @@ async def handle_task(task: str, p: dict):
             + "Write a 3-sentence professional summary (45-65 words) in third person without pronouns, "
               "mirroring the target job's keywords where honest. Plain text, no label, no quotes."
         )
-        out = await call_ai([{"role": "system", "content": SYSTEM}, {"role": "user", "content": msg}], 800, 0.55)
+        out = await call_ai([{"role": "system", "content": SYSTEM}, {"role": "user", "content": msg}], 1200, 0.55)
         return {"summary": strip_fences(out).strip('"').strip()}
 
     if task == "skills":
@@ -180,7 +214,7 @@ async def handle_task(task: str, p: dict):
             "List 12 hard and soft skills that belong on this resume, ATS-recognizable wording, 1-3 words each. "
             'Return JSON only: {"skills": ["...", "..."]}'
         )
-        out = await call_ai([{"role": "system", "content": SYSTEM}, {"role": "user", "content": msg}], 700)
+        out = await call_ai([{"role": "system", "content": SYSTEM}, {"role": "user", "content": msg}], 1000)
         data = parse_json(out)
         if isinstance(data, dict) and isinstance(data.get("skills"), list):
             return {"skills": [str(s) for s in data["skills"]][:14]}
@@ -196,7 +230,7 @@ async def handle_task(task: str, p: dict):
             'Return JSON only: {"score": 0, "verdict": "one sentence", "strengths": ["..."], '
             '"fixes": [{"issue": "...", "fix": "..."}], "rewrite": {"before": "...", "after": "..."}}'
         )
-        out = await call_ai([{"role": "system", "content": SYSTEM}, {"role": "user", "content": msg}], 1800, 0.35, effort="low")
+        out = await call_ai([{"role": "system", "content": SYSTEM}, {"role": "user", "content": msg}], 2500, 0.35)
         data = parse_json(out)
         if not isinstance(data, dict):
             raise HTTPException(502, "Could not parse the review. Try again.")
@@ -213,7 +247,7 @@ async def handle_task(task: str, p: dict):
             "('I am writing to apply'), no invented facts. Start with the hook. Plain text with a greeting "
             "and sign-off using the candidate's name."
         )
-        out = await call_ai([{"role": "system", "content": SYSTEM}, {"role": "user", "content": msg}], 1500, 0.6)
+        out = await call_ai([{"role": "system", "content": SYSTEM}, {"role": "user", "content": msg}], 2000, 0.6)
         return {"letter": strip_fences(out)}
 
     if task == "tailor":
@@ -226,7 +260,7 @@ async def handle_task(task: str, p: dict):
             'Return JSON only: {"summary": "...", "bullets": ["...", "...", "..."], '
             '"keywords": ["..."]}'
         )
-        out = await call_ai([{"role": "system", "content": SYSTEM}, {"role": "user", "content": msg}], 1600, 0.45)
+        out = await call_ai([{"role": "system", "content": SYSTEM}, {"role": "user", "content": msg}], 2200, 0.45)
         data = parse_json(out)
         if not isinstance(data, dict):
             raise HTTPException(502, "Could not parse tailoring output. Try again.")
@@ -244,7 +278,7 @@ async def ai_endpoint(request: Request):
 
 @app.get("/api/health")
 async def health():
-    return {"ok": True, "model": MODEL, "has_key": bool(API_KEY)}
+    return {"ok": True, "models": MODELS, "providers": {"openrouter": bool(OPENROUTER_KEY), "opencode": bool(OPENCODE_KEY)}}
 
 # ---------------------------------------------------------------- DOCX export
 def _p(doc, text="", size=10.5, bold=False, italic=False, space_after=2, space_before=0,

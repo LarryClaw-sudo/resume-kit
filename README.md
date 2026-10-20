@@ -14,9 +14,19 @@ Self-hosted AI resume builder — the capability set of resume-now.com, rebuilt 
 
 ## Stack
 
-Vanilla JS SPA + FastAPI. AI requests proxy through the server to opencode zen
-(`deepseek-v4.1-flash`), so the API key never reaches the client.
+Vanilla JS SPA + FastAPI. AI requests proxy through the server to **free OpenRouter
+models**, so the API key never reaches the client. Requests try a chain and fall
+through on 429/5xx/empty:
+
+1. `nvidia/nemotron-3-ultra-550b-a55b:free` (strongest, ~10-18s)
+2. `minimax/minimax-m3.1-flash:free` (faster fallback)
+3. `openrouter/free` (router picks whatever is up)
+
 Rate limits: 60 AI calls/hour/IP plus a global daily cap.
+
+Note: opencode's `deepseek-v4.1-flash-free` cannot be used here — that tier is
+gated to calls made from inside the OpenCode client itself (`FreeTierError`
+for every API request, key or no key).
 
 ## Run locally
 
@@ -40,9 +50,9 @@ Server side: `/opt/resumekit`, systemd unit `resumekit.service`, secrets in
 
 | var | default | purpose |
 |---|---|---|
-| `OPENCODE_GO_API_KEY` | — | required, opencode zen key |
-| `OPENCODE_BASE_URL` | `https://opencode.ai/zen/go/v1` | provider base |
-| `RESUME_MODEL` | `deepseek-v4.1-flash` | model id |
+| `OPENROUTER_API_KEY` | — | required for the free models |
+| `AI_MODELS` | nemotron → minimax → openrouter/free | comma-separated fallback chain |
+| `OPENCODE_GO_API_KEY` | — | optional, only for non-`:free` model ids |
 | `GLOBAL_DAILY_AI` | `1500` | global daily AI call cap |
 
 ## API
@@ -51,8 +61,9 @@ Server side: `/opt/resumekit`, systemd unit `resumekit.service`, secrets in
 - `POST /api/export/docx` `{resume}` — returns a .docx
 - `GET /api/health`
 
-## Note on the model
+## Note on free models
 
-`deepseek-v4.1-flash` is a reasoning model. Requests send `reasoning_effort: "minimal"`;
-without it the reasoning tokens consume the whole `max_tokens` budget and content comes
-back empty.
+The free OpenRouter models are reasoning models. Reasoning tokens count against
+`max_tokens`, so a short budget returns empty content; `call_ai` retries once at
+double the budget before moving to the next model in the chain. Free tier also
+rate-limits hard (429), which is why the chain exists instead of a single model.
