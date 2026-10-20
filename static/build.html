@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Builder — ResumeKit</title>
+<meta name="theme-color" content="#0f766e">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/css/builder.css">
+</head>
+<body>
+
+<div class="topbar">
+  <a class="brand" href="/"><span class="mark">R</span>ResumeKit</a>
+  <div class="tb-group">
+    <select class="tpl-select" id="tplSelect" title="Template">
+      <option value="classic">Classic</option>
+      <option value="modern">Modern</option>
+      <option value="minimal">Minimal</option>
+      <option value="bold">Bold</option>
+      <option value="elegant">Elegant</option>
+      <option value="compact">Compact</option>
+      <option value="tech">Technical</option>
+      <option value="timeline">Timeline</option>
+    </select>
+    <div class="swatches" id="swatches"></div>
+    <div class="seg" id="fontSeg">
+      <button data-font="serif">Serif</button>
+      <button data-font="sans" class="active">Sans</button>
+    </div>
+  </div>
+  <div class="tb-group">
+    <button class="btn btn-outline" id="btnReview"><span class="icon">◎</span>Review</button>
+    <button class="btn btn-outline" id="btnCover"><span class="icon">✉</span>Cover letter</button>
+  </div>
+  <div class="tb-right">
+    <button class="btn btn-outline" id="btnImport" title="Import a saved draft">Import</button>
+    <button class="btn btn-outline" id="btnJson" title="Export draft as JSON">JSON</button>
+    <button class="btn btn-outline" id="btnDocx">Word</button>
+    <button class="btn btn-primary" id="btnPdf"><span class="icon">↓</span>Download PDF</button>
+    <input type="file" id="fileInput" accept="application/json" hidden>
+  </div>
+</div>
+
+<div class="layout">
+  <div class="panel" id="panel">
+    <div class="tabs" id="tabs"></div>
+    <div id="editor"></div>
+    <div class="acc-hint" style="text-align:center;padding-top:18px">Saved automatically in this browser.</div>
+  </div>
+
+  <div class="preview-wrap" id="previewWrap">
+    <div class="pv-bar">
+      <button id="zoomOut">−</button><span id="zoomLabel">62%</span><button id="zoomIn">+</button>
+      <button id="zoomFit">Fit</button>
+    </div>
+    <div class="sheet-outer" id="sheetOuter">
+      <div class="page"><div class="resume" id="resume"></div></div>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<div class="modal" id="modal">
+  <div class="modal-card">
+    <button class="modal-close" id="modalClose">✕</button>
+    <div id="modalBody"></div>
+  </div>
+</div>
+
+<script src="/js/builder.js"></script>
+</body>
+</html>
