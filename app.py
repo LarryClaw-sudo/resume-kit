@@ -2,6 +2,7 @@
 ResumeKit backend: static SPA + AI proxy (free OpenRouter models with fallback chain) + DOCX export.
 """
 import asyncio
+import base64
 import io
 import json
 import os
@@ -33,6 +34,13 @@ OPENCODE_BASE = os.environ.get("OPENCODE_BASE_URL", "https://opencode.ai/zen/go/
 DEFAULT_CHAIN = [
     "nvidia/nemotron-3-ultra-550b-a55b:free",
     "minimax/minimax-m3.1-flash:free",
+    "nvidia/nemotron-3-super-120b-a12b:free",
+    "google/gemma-4-31b-it:free",
+    "xingchen-agi/xing4.0-29b-a4b:free",
+    "openrouter/free",
+]
+VISION_MODELS = [
+    "nvidia/nemotron-3.5-super-vl:free",
     "openrouter/free",
 ]
 MODELS = [m.strip() for m in os.environ.get("AI_MODELS", "").split(",") if m.strip()] or DEFAULT_CHAIN
@@ -46,6 +54,16 @@ PER_IP_HOURLY = 60
 GLOBAL_DAILY = int(os.environ.get("GLOBAL_DAILY_AI", "1500"))
 
 app = FastAPI(title="ResumeKit", docs_url=None, redoc_url=None)
+
+
+@app.middleware("http")
+async def no_store_html(request: Request, call_next):
+    """HTML must never be cached: a stale page ships stale JS to the user."""
+    resp = await call_next(request)
+    ctype = resp.headers.get("content-type", "")
+    if ctype.startswith("text/html") or request.url.path.startswith("/api/"):
+        resp.headers["Cache-Control"] = "no-store, max-age=0"
+    return resp
 
 _ip_hits = defaultdict(list)
 _daily = {"day": date.today().isoformat(), "count": 0}
@@ -125,25 +143,38 @@ async def call_ai(messages, max_tokens=900, temperature=0.5, effort="minimal", m
     """Try each free model in the chain. Reasoning models burn budget on thinking,
     so short answers come back empty; retry once with double the budget before
     falling through to the next model."""
+    chain = list(models or MODELS)
     last_err = None
-    for model in (models or MODELS):
-        for attempt, budget in enumerate((max_tokens, max_tokens * 2)):
-            try:
-                content = await _one(model, messages, budget, temperature)
-                if content:
-                    return content
-            except HTTPException as e:
-                last_err = e
-                if e.status_code == 429:
-                    await asyncio.sleep(1.2 + attempt)
-                    continue
-                break
-            except httpx.TimeoutException:
-                last_err = HTTPException(504, "AI timed out.")
-                break
-            except Exception as e:  # malformed provider reply
-                last_err = HTTPException(502, str(e))
-                break
+    # Free pools get congested in bursts. Sweep the chain three times with
+    # backoff before giving up, so a transient 429 doesn't turn into a 502.
+    for round_no in range(3):
+        for model in chain:
+            for attempt, budget in enumerate((max_tokens, max_tokens * 2)):
+                try:
+                    content = await _one(model, messages, budget, temperature)
+                    if content:
+                        return content
+                except HTTPException as e:
+                    last_err = e
+                    if e.status_code == 429:
+                        await asyncio.sleep(0.8 + round_no * 1.5 + attempt)
+                        continue
+                    break
+                except httpx.TimeoutException:
+                    last_err = HTTPException(504, "AI timed out.")
+                    break
+                except Exception as e:  # malformed provider reply
+                    last_err = HTTPException(502, str(e))
+                    break
+        await asyncio.sleep(1.0 + round_no)
+    # Last resort: the flat-rate Go plan, so a user never hits a wall.
+    if OPENCODE_KEY and "deepseek-v4.1-flash" not in chain:
+        try:
+            content = await _one("deepseek-v4.1-flash", messages, max_tokens * 2, temperature)
+            if content:
+                return content
+        except Exception as e:
+            last_err = HTTPException(502, str(e))
     raise last_err or HTTPException(502, "All free models are busy right now. Try again in a minute.")
 
 
@@ -473,6 +504,20 @@ def pdf_text(blob: bytes) -> str:
     return clean_text("\n".join(chunks))
 
 
+def pdf_images(blob: bytes, max_pages: int = 3) -> list:
+    """Render pages to base64 PNGs for scanned/image-only PDFs."""
+    try:
+        import fitz  # PyMuPDF
+    except ImportError:
+        return []
+    out = []
+    doc = fitz.open(stream=blob, filetype="pdf")
+    for page in list(doc)[:max_pages]:
+        pix = page.get_pixmap(dpi=150)
+        out.append(base64.b64encode(pix.tobytes("png")).decode())
+    return out
+
+
 def docx_text(blob: bytes) -> str:
     doc = Document(io.BytesIO(blob))
     parts = [p.text for p in doc.paragraphs]
@@ -614,6 +659,23 @@ async def parse_resume_text(text: str) -> dict:
     return normalize(data)
 
 
+async def parse_resume_images(images: list) -> dict:
+    content = [{"type": "text", "text": (
+        "This is a scan of a resume. Read every word and extract it into JSON exactly as written; "
+        "do not rewrite or invent. One object per job with its bullets. current=true when the job says Present. "
+        "Group skills under sensible categories. Omit anything absent.\n\n"
+        f"JSON shape:\n{SCHEMA_HINT}"
+    )}]
+    for b64 in images:
+        content.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}})
+    raw = await call_ai([{"role": "user", "content": content}], 3000, 0.15,
+                        models=VISION_MODELS + [m for m in FAST_MODELS if m not in VISION_MODELS])
+    data = parse_json(raw)
+    if data is None:
+        raise HTTPException(502, "Could not read that scan. Try pasting the text instead.")
+    return normalize(data)
+
+
 @app.post("/api/import")
 async def import_resume(request: Request, file: UploadFile = File(...)):
     check_limit(request)
@@ -637,6 +699,14 @@ async def import_resume(request: Request, file: UploadFile = File(...)):
         raise
     except Exception as e:
         raise HTTPException(422, f"Could not read that file: {e}")
+
+    # Image-only PDF: no text layer, so read the pages visually instead.
+    if len(text) < 150 and (name.endswith(".pdf") or blob[:4] == b"%PDF"):
+        pages = pdf_images(blob)
+        if pages:
+            return JSONResponse({"resume": await parse_resume_images(pages), "method": "vision"})
+        raise HTTPException(422, "That PDF is a scan with no text layer. Paste the text instead.")
+
     return JSONResponse({"resume": await parse_resume_text(text)})
 
 

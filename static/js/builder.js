@@ -559,16 +559,23 @@ function openImport(err) {
 async function importFile(file) {
   openModal(`<h2>Reading your resume</h2>
     <p class="sub">${esc(file.name)}</p>
+    <button class="linkbtn" id="impSwitchPaste" style="float:right">paste text instead</button>
     <div id="impProgress" style="display:flex;align-items:center;gap:10px;color:var(--muted);font-size:13.5px">
-      <span class="spin" style="border-color:#cbd5e1;border-top-color:#0f766e"></span> Extracting sections, dates and bullets…
+      <span class="spin" style="border-color:#cbd5e1;border-top-color:#0f766e"></span> Extracting sections, dates and bullets. Scans take up to a minute.
     </div>
     <div id="impOut" style="margin-top:14px"></div>`);
+  $('#impSwitchPaste').onclick = () => openImport();
   try {
     const fd = new FormData();
     fd.append('file', file);
-    const r = await fetch('/api/import', { method: 'POST', body: fd });
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 200000);
+    let r;
+    try {
+      r = await fetch('/api/import', { method: 'POST', body: fd, signal: ctrl.signal });
+    } finally { clearTimeout(timer); }
     const data = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(data.detail || 'Import failed');
+    if (!r.ok) throw new Error(data.detail || 'Import failed (' + r.status + ')');
     const layout = { template: state.template, font: state.font, accent: state.accent };
     state = Object.assign(sample(), data.resume, layout);
     save(); renderEditor(); renderPreview();
@@ -595,6 +602,7 @@ $('#resumeFile').onchange = e => {
   const f = e.target.files && e.target.files[0];
   if (f) importFile(f);
 };
+$('#btnPasteImport').onclick = () => openImport();
 
 $('#fileInput').onchange = async e => {
   const f = e.target.files[0]; if (!f) return;
