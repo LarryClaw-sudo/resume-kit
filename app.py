@@ -54,6 +54,7 @@ WINDOW = 3600
 PER_IP_HOURLY = 60
 GLOBAL_DAILY = int(os.environ.get("GLOBAL_DAILY_AI", "1500"))
 
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("resumekit")
 log.setLevel(logging.INFO)
 
